@@ -201,9 +201,22 @@ fn on_tray_right_click(hwnd: HWND) {
             .map(|s| (s.settings.enabled, s.settings.threshold_db, s.settings.hotkey.clone()))
             .unwrap_or((false, -34.0, String::new()));
 
-        let bound = volume::bound_name();
+        let status = match volume::bound_name() {
+            Some(n) => {
+                let lv = volume::current_level_db()
+                    .map(|d| format!("{:.1} dB", d))
+                    .unwrap_or_else(|| "—".to_string());
+                if volume::is_silenced() {
+                    format!("{} · {} · 已静音", n, lv)
+                } else {
+                    format!("{} · {}", n, lv)
+                }
+            }
+            None => "未找到手机音轨（手机未播放？）".to_string(),
+        };
+
         let muted = volume::is_manual_muted();
-        let menu = menu::create_context_menu(enabled, threshold, bound.as_deref(), muted, &hotkey);
+        let menu = menu::create_context_menu(enabled, threshold, muted, &hotkey, &status);
         let _ = TrackPopupMenu(menu, TRACK_POPUP_MENU_FLAGS(0), pt.x, pt.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
     }

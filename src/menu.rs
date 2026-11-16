@@ -11,12 +11,11 @@ pub const IDM_EXIT: u32 = 2;
 
 /// 静音门相关命令
 pub const IDM_GATE_TOGGLE: u32 = 10;
-pub const IDM_GATE_TH_BASE: u32 = 20; // 20..=23
-pub const IDM_GATE_TH_COUNT: u32 = 4;
+pub const IDM_GATE_TH_BASE: u32 = 20; // 20..=24
+/// 可选门槛（dBFS），跨度拉大方便试
+pub const THRESHOLD_PRESETS: [f32; 5] = [-20.0, -27.0, -34.0, -42.0, -50.0];
+pub const IDM_GATE_TH_COUNT: u32 = THRESHOLD_PRESETS.len() as u32;
 pub const IDM_GATE_MUTE: u32 = 30;
-
-/// 可选门槛（dBFS）
-pub const THRESHOLD_PRESETS: [f32; 4] = [-30.0, -34.0, -38.0, -42.0];
 
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(IDM_DEVICE_BASE);
 
@@ -31,9 +30,9 @@ fn wide(s: &str) -> Vec<u16> {
 pub fn create_context_menu(
     gate_enabled: bool,
     threshold_db: f32,
-    bound: Option<&str>,
     manual_muted: bool,
     hotkey: &str,
+    status: &str,
 ) -> HMENU {
     unsafe {
         let menu = CreatePopupMenu().expect("CreatePopupMenu failed");
@@ -69,16 +68,13 @@ pub fn create_context_menu(
                     .0,
             );
         }
-        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(wide("安静门槛").as_ptr()));
+        let sub_label = format!("安静门槛（{} dB）", threshold_db as i32);
+        let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(wide(&sub_label).as_ptr()));
 
         let mute_label = if manual_muted { "取消静音" } else { "立即静音" };
         let _ = AppendMenuW(menu, MF_STRING, IDM_GATE_MUTE as usize, PCWSTR(wide(mute_label).as_ptr()));
 
-        let status = match bound {
-            Some(n) => format!("音轨: {}", n),
-            None => "音轨: 未找到（手机未播放？）".to_string(),
-        };
-        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(&status).as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(status).as_ptr()));
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(wide("退出").as_ptr()));

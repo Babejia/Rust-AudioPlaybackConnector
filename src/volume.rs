@@ -39,7 +39,19 @@ struct Gate {
     quiet_since: Option<Instant>,
     last_try: Option<Instant>,
     ticks: u32,
+    /// 静音后电表被遮住（一直读 0）时为 true，改用定期开窗重测
+    blind: bool,
+    zero_hits: u32,
+    /// 上次开窗探测的时间
+    last_probe: Option<Instant>,
+    /// 正在进行的探测窗口起点
+    probe_start: Option<Instant>,
 }
+
+/// 探测窗口长度：静音期间短暂解除静音，用来重新测电平
+const PROBE_MS: u128 = 90;
+/// 探测间隔
+const PROBE_INTERVAL_MS: u128 = 2000;
 
 static GATE: Mutex<Option<Gate>> = Mutex::new(None);
 
@@ -52,10 +64,34 @@ pub fn init() {
         quiet_since: None,
         last_try: None,
         ticks: 0,
+        blind: false,
+        zero_hits: 0,
+        last_probe: None,
+        probe_start: None,
     });
 }
 
 fn db_to_linear(db: f32) -> f32 { 10f32.powf(db / 20.0) }
+
+fn linear_to_db(v: f32) -> f32 {
+    if v <= 0.0 { -120.0 } else { 20.0 * v.log10() }
+}
+
+/// 供菜单显示：当前这条音轨的电平（dBFS）
+pub fn current_level_db() -> Option<f32> {
+    let g = GATE.lock().ok()?;
+    let b = g.as_ref()?.bound.as_ref()?;
+    let p = unsafe { b.meter.GetPeakValue() }.ok()?;
+    Some(linear_to_db(p))
+}
+
+/// 供菜单显示：当前是否处于静音（自动或手动）
+pub fn is_silenced() -> bool {
+    match GATE.lock() {
+        Ok(g) => g.as_ref().map(|x| x.muted || x.manual_mute).unwrap_or(false),
+        Err(_) => false,
+    }
+}
 
 /// 解析形如 "Pause" / "Ctrl+Alt+F12" / "Shift+F9" 的热键描述
 pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
@@ -242,6 +278,9 @@ pub fn tick(s: &GateSettings) {
             Some(b) => {
                 gate.bound = Some(b);
                 gate.quiet_since = None;
+                gate.blind = false;
+                gate.zero_hits = 0;
+                gate.probe_start = None;
             }
             None => {
                 gate.bound = None;
@@ -263,6 +302,7 @@ pub fn tick(s: &GateSettings) {
 
     // 手动钉住静音时不参与自动判断
     if gate.manual_mute {
+        gate.probe_start = None;
         return;
     }
 
@@ -270,25 +310,83 @@ pub fn tick(s: &GateSettings) {
     let release = db_to_linear(s.release_db);
     let hold_ms = s.hold_ms as u128;
 
+    // ① 探测窗口进行中：等窗口走完再判定
+    if let Some(t0) = gate.probe_start {
+        if t0.elapsed().as_millis() < PROBE_MS {
+            return;
+        }
+        gate.probe_start = None;
+        gate.last_probe = Some(Instant::now());
+        if peak > release {
+            // 声音回来了：保持不静音
+            if let Some(b) = &gate.bound {
+                set_mute(b, false);
+            }
+            gate.muted = false;
+            gate.quiet_since = None;
+            gate.zero_hits = 0;
+        } else {
+            // 还是很安静：关回去
+            if let Some(b) = &gate.bound {
+                set_mute(b, true);
+            }
+            gate.muted = true;
+        }
+        return;
+    }
+
+    // ② 正被我们静音中
+    if gate.muted {
+        // 电表没被遮住的情况：一读到电平就能立刻恢复，无需开窗
+        if peak > release {
+            if let Some(b) = &gate.bound {
+                set_mute(b, false);
+            }
+            gate.muted = false;
+            gate.quiet_since = None;
+            gate.zero_hits = 0;
+            return;
+        }
+        // 电表被静音遮住时永远读 0，累计够了就改用定期开窗重测
+        if peak <= 0.0 {
+            gate.zero_hits = gate.zero_hits.saturating_add(1);
+            if gate.zero_hits >= 15 {
+                gate.blind = true;
+            }
+        } else {
+            gate.zero_hits = 0;
+        }
+        let due = gate
+            .last_probe
+            .map_or(true, |t| t.elapsed().as_millis() >= PROBE_INTERVAL_MS);
+        if gate.blind && due {
+            if let Some(b) = &gate.bound {
+                set_mute(b, false);
+            }
+            gate.probe_start = Some(Instant::now());
+            gate.quiet_since = None;
+        }
+        return;
+    }
+
+    // ③ 正常判定
     if peak < threshold {
         let now = Instant::now();
         if gate.quiet_since.is_none() {
             gate.quiet_since = Some(now);
         }
         let quiet_ms = gate.quiet_since.unwrap().elapsed().as_millis();
-        if !gate.muted && quiet_ms >= hold_ms {
+        if quiet_ms >= hold_ms {
             if let Some(b) = &gate.bound {
                 set_mute(b, true);
             }
             gate.muted = true;
+            gate.last_probe = Some(Instant::now());
         }
     } else {
         gate.quiet_since = None;
-        if gate.muted && peak > release {
-            if let Some(b) = &gate.bound {
-                set_mute(b, false);
-            }
-            gate.muted = false;
+        if peak > release {
+            gate.zero_hits = 0;
         }
     }
 }
@@ -310,8 +408,12 @@ pub fn toggle_manual_mute() -> bool {
         set_mute(b, want);
     }
     gate.muted = want;
+    gate.probe_start = None;
+    gate.last_probe = None;
     if !want {
         gate.quiet_since = None;
+        gate.blind = false;
+        gate.zero_hits = 0;
     }
     want
 }
@@ -346,5 +448,9 @@ pub fn release_all() {
         gate.manual_mute = false;
         gate.bound = None;
         gate.quiet_since = None;
+        gate.blind = false;
+        gate.zero_hits = 0;
+        gate.last_probe = None;
+        gate.probe_start = None;
     }
 }
