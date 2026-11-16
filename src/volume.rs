@@ -1,11 +1,17 @@
 //! 手机音轨自动静音门。
 //!
-//! Windows 把手机经蓝牙传来的音频挂成「默认输出端点上的一个普通音频会话」。
-//! iPhone 这类手机调音量时**不会**动会话音量（它恒为 100%），而是在手机内部
-//! 先把 PCM 压小再编码，所以电脑这边只能从「信号电平」看出手机被调小了。
+//! 背景：iPhone 走 A2DP Sink 时调音量**不会**改 Windows 的会话音量（会话恒为
+//! 100%），它在手机内部先把 PCM 压小再编码。所以电脑这边只能从「信号电平」
+//! 判断手机音量高低。
 //!
-//! 本模块持续采样该会话的峰值电平，持续低于门槛就把这条会话静音（真 0），
-//! 电平回升再自动恢复。只影响手机这一路，不动电脑总音量。
+//! 关键难点：会话一旦被 `SetMute(true)`，它的峰值电表会变成 0，从此再也看不到
+//! 真实电平，判定就会永久卡在“很安静”。
+//!
+//! 解决办法：**不用真静音，改用把会话音量压到极低（约 −50 dB）**。
+//! 这样电表依然跟着信号走，只要把读数按衰减量补偿回去，就能持续得到真实电平：
+//!   - 手机调大 → 补偿后的电平上升 → 立刻还原音量
+//!   - 手机很小 → 电平低于门槛 → 压到 −50 dB（听不见）
+//! 全程连续测量，没有任何“开窗探测”，所以不会有周期性漏音。
 
 use std::sync::Mutex;
 use std::time::Instant;
@@ -17,7 +23,9 @@ use windows::Win32::System::Com::*;
 
 use crate::config::GateSettings;
 
-/// 已绑定的目标会话
+/// 自动静音时施加的会话增益（约 −50 dB，听不见但电表仍可测）
+const SILENCE_GAIN: f32 = 0.0032;
+
 struct Bound {
     /// 持有它保证会话对象存活
     _ctl: IAudioSessionControl,
@@ -26,32 +34,36 @@ struct Bound {
     name: String,
 }
 
-// COM 接口指针本身不是 Send；这里只从 UI 线程（定时器）访问，跨线程只是
-// 为了让静态 Mutex 能成立，访问始终发生在同一 STA 线程上。
+// COM 接口指针本身不是 Send；这里只从 UI 线程（定时器/菜单）访问，
+// unsafe impl 只是为了让静态 Mutex 能成立。
 unsafe impl Send for Bound {}
+
+/// 衰减是否反映在电表读数上（用于把读数补偿回真实电平）
+#[derive(Clone, Copy, PartialEq)]
+enum Calib {
+    /// 还没验证过
+    Unknown,
+    /// 电表读数会被会话增益缩放 → 需要除以增益
+    Reflected,
+    /// 电表读数是施加增益之前的原始电平 → 不用补偿
+    Raw,
+}
 
 struct Gate {
     bound: Option<Bound>,
-    /// 当前是否由我们静音
-    muted: bool,
-    /// 手动钉住静音（热键切换）
+    /// 当前是否由我们压低音量
+    silenced: bool,
+    /// 手动钉住静音（热键切换，真静音）
     manual_mute: bool,
     quiet_since: Option<Instant>,
     last_try: Option<Instant>,
     ticks: u32,
-    /// 静音后电表被遮住（一直读 0）时为 true，改用定期开窗重测
-    blind: bool,
-    zero_hits: u32,
-    /// 上次开窗探测的时间
-    last_probe: Option<Instant>,
-    /// 正在进行的探测窗口起点
-    probe_start: Option<Instant>,
+    calib: Calib,
+    /// 压低音量那一刻读到的原始电平，用来判断电表是否被缩放
+    ref_before: f32,
+    /// 是否已用这一刻的读数做过校准
+    calib_probed: bool,
 }
-
-/// 探测窗口长度：静音期间短暂解除静音，用来重新测电平
-const PROBE_MS: u128 = 90;
-/// 探测间隔
-const PROBE_INTERVAL_MS: u128 = 2000;
 
 static GATE: Mutex<Option<Gate>> = Mutex::new(None);
 
@@ -59,15 +71,14 @@ pub fn init() {
     let mut g = GATE.lock().unwrap();
     *g = Some(Gate {
         bound: None,
-        muted: false,
+        silenced: false,
         manual_mute: false,
         quiet_since: None,
         last_try: None,
         ticks: 0,
-        blind: false,
-        zero_hits: 0,
-        last_probe: None,
-        probe_start: None,
+        calib: Calib::Unknown,
+        ref_before: 0.0,
+        calib_probed: false,
     });
 }
 
@@ -75,22 +86,6 @@ fn db_to_linear(db: f32) -> f32 { 10f32.powf(db / 20.0) }
 
 fn linear_to_db(v: f32) -> f32 {
     if v <= 0.0 { -120.0 } else { 20.0 * v.log10() }
-}
-
-/// 供菜单显示：当前这条音轨的电平（dBFS）
-pub fn current_level_db() -> Option<f32> {
-    let g = GATE.lock().ok()?;
-    let b = g.as_ref()?.bound.as_ref()?;
-    let p = unsafe { b.meter.GetPeakValue() }.ok()?;
-    Some(linear_to_db(p))
-}
-
-/// 供菜单显示：当前是否处于静音（自动或手动）
-pub fn is_silenced() -> bool {
-    match GATE.lock() {
-        Ok(g) => g.as_ref().map(|x| x.muted || x.manual_mute).unwrap_or(false),
-        Err(_) => false,
-    }
 }
 
 /// 解析形如 "Pause" / "Ctrl+Alt+F12" / "Shift+F9" 的热键描述
@@ -166,7 +161,6 @@ unsafe fn pwstr_to_string(p: PWSTR) -> String {
 }
 
 /// 严格匹配：用户指定关键字，或当前连接的 A2DP 设备名出现在音轨名里。
-/// 换手机、改设备名都不用改代码。
 fn is_target_strict(name: &str, s: &GateSettings) -> bool {
     if name.is_empty() {
         return false;
@@ -191,14 +185,11 @@ fn try_bind(s: &GateSettings) -> Option<Bound> {
     unsafe {
         let enumr: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let dev = enumr
-            .GetDefaultAudioEndpoint(eRender, eConsole)
-            .ok()?;
+        let dev = enumr.GetDefaultAudioEndpoint(eRender, eConsole).ok()?;
         let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None).ok()?;
         let sessions = mgr.GetSessionEnumerator().ok()?;
         let count = sessions.GetCount().ok()?;
 
-        // 先找精确命中的，找不到再退回宽松匹配（避免认错成别的手机的残留音轨）
         let mut loose: Option<(IAudioSessionControl, String)> = None;
 
         for i in 0..count {
@@ -232,9 +223,39 @@ fn make_bound(ctl: IAudioSessionControl, name: String) -> Option<Bound> {
     Some(Bound { _ctl: ctl, meter, vol, name })
 }
 
+/// 设置会话增益（0.0 = 真静音，1.0 = 原始音量）
+fn set_gain(bound: &Bound, gain: f32) {
+    let _ = unsafe { bound.vol.SetMasterVolume(gain, std::ptr::null()) };
+}
+
 fn set_mute(bound: &Bound, mute: bool) {
     let flag = if mute { BOOL(1) } else { BOOL(0) };
     let _ = unsafe { bound.vol.SetMute(flag, std::ptr::null()) };
+}
+
+fn read_peak(bound: &Bound) -> Option<f32> {
+    unsafe { bound.meter.GetPeakValue() }.ok()
+}
+
+/// 供菜单显示：把当前读数换算成手机实际电平（dBFS）。
+/// 即使处于压低状态也能显示真实电平，方便标定门槛。
+pub fn current_level_db() -> Option<f32> {
+    let g = GATE.lock().ok()?;
+    let gate = g.as_ref()?;
+    let b = gate.bound.as_ref()?;
+    let raw = read_peak(b)?;
+    let source = match gate.calib {
+        Calib::Reflected => raw / SILENCE_GAIN,
+        _ => raw,
+    };
+    Some(linear_to_db(source))
+}
+
+pub fn is_silenced() -> bool {
+    match GATE.lock() {
+        Ok(g) => g.as_ref().map(|x| x.silenced || x.manual_mute).unwrap_or(false),
+        Err(_) => false,
+    }
 }
 
 /// 每 100ms 由 UI 线程定时器调用
@@ -250,21 +271,23 @@ pub fn tick(s: &GateSettings) {
 
     // 功能关闭：恢复原状
     if !s.enabled {
-        if gate.muted {
-            if let Some(b) = &gate.bound {
+        if let Some(b) = &gate.bound {
+            if gate.silenced || gate.manual_mute {
                 set_mute(b, false);
+                set_gain(b, 1.0);
             }
-            gate.muted = false;
         }
+        gate.silenced = false;
         gate.manual_mute = false;
         gate.bound = None;
+        gate.calib = Calib::Unknown;
         return;
     }
 
     gate.ticks = gate.ticks.wrapping_add(1);
 
     // 绑定：未绑定时重试（最多 2 秒一次），并定期重新枚举以适配换设备/换手机
-    let need_bind = gate.bound.is_none() || gate.ticks % 300 == 0;
+    let need_bind = gate.bound.is_none() || gate.ticks % 1000 == 0;
     if need_bind {
         if gate.bound.is_none() {
             if let Some(t) = gate.last_try {
@@ -278,9 +301,8 @@ pub fn tick(s: &GateSettings) {
             Some(b) => {
                 gate.bound = Some(b);
                 gate.quiet_since = None;
-                gate.blind = false;
-                gate.zero_hits = 0;
-                gate.probe_start = None;
+                gate.calib = Calib::Unknown;
+                gate.calib_probed = false;
             }
             None => {
                 gate.bound = None;
@@ -289,88 +311,55 @@ pub fn tick(s: &GateSettings) {
         }
     }
 
-    let peak = {
+    let raw = {
         let b = gate.bound.as_ref().unwrap();
-        match unsafe { b.meter.GetPeakValue() } {
-            Ok(p) => p,
-            Err(_) => {
+        match read_peak(b) {
+            Some(p) => p,
+            None => {
                 gate.bound = None;
                 return;
             }
         }
     };
 
-    // 手动钉住静音时不参与自动判断
+    // 手动静音：真静音，不参与自动判定
     if gate.manual_mute {
-        gate.probe_start = None;
         return;
     }
+
+    // 校准：压低音量后第一次读到的电平，用来判断电表是否跟着缩放
+    if gate.silenced && !gate.calib_probed && gate.ref_before > 0.0 {
+        gate.calib_probed = true;
+        gate.calib = if raw <= gate.ref_before * 0.3 {
+            Calib::Reflected
+        } else {
+            Calib::Raw
+        };
+    }
+
+    let source = match gate.calib {
+        Calib::Reflected => raw / SILENCE_GAIN,
+        _ => raw,
+    };
 
     let threshold = db_to_linear(s.threshold_db);
     let release = db_to_linear(s.release_db);
     let hold_ms = s.hold_ms as u128;
 
-    // ① 探测窗口进行中：等窗口走完再判定
-    if let Some(t0) = gate.probe_start {
-        if t0.elapsed().as_millis() < PROBE_MS {
-            return;
-        }
-        gate.probe_start = None;
-        gate.last_probe = Some(Instant::now());
-        if peak > release {
-            // 声音回来了：保持不静音
+    if gate.silenced {
+        // 已经压低音量：真实电平回来了就恢复
+        if source > release {
             if let Some(b) = &gate.bound {
-                set_mute(b, false);
+                set_gain(b, 1.0);
             }
-            gate.muted = false;
-            gate.quiet_since = None;
-            gate.zero_hits = 0;
-        } else {
-            // 还是很安静：关回去
-            if let Some(b) = &gate.bound {
-                set_mute(b, true);
-            }
-            gate.muted = true;
-        }
-        return;
-    }
-
-    // ② 正被我们静音中
-    if gate.muted {
-        // 电表没被遮住的情况：一读到电平就能立刻恢复，无需开窗
-        if peak > release {
-            if let Some(b) = &gate.bound {
-                set_mute(b, false);
-            }
-            gate.muted = false;
-            gate.quiet_since = None;
-            gate.zero_hits = 0;
-            return;
-        }
-        // 电表被静音遮住时永远读 0，累计够了就改用定期开窗重测
-        if peak <= 0.0 {
-            gate.zero_hits = gate.zero_hits.saturating_add(1);
-            if gate.zero_hits >= 15 {
-                gate.blind = true;
-            }
-        } else {
-            gate.zero_hits = 0;
-        }
-        let due = gate
-            .last_probe
-            .map_or(true, |t| t.elapsed().as_millis() >= PROBE_INTERVAL_MS);
-        if gate.blind && due {
-            if let Some(b) = &gate.bound {
-                set_mute(b, false);
-            }
-            gate.probe_start = Some(Instant::now());
+            gate.silenced = false;
             gate.quiet_since = None;
         }
         return;
     }
 
-    // ③ 正常判定
-    if peak < threshold {
+    // 正常判定
+    if source < threshold {
         let now = Instant::now();
         if gate.quiet_since.is_none() {
             gate.quiet_since = Some(now);
@@ -378,16 +367,15 @@ pub fn tick(s: &GateSettings) {
         let quiet_ms = gate.quiet_since.unwrap().elapsed().as_millis();
         if quiet_ms >= hold_ms {
             if let Some(b) = &gate.bound {
-                set_mute(b, true);
+                set_gain(b, SILENCE_GAIN);
             }
-            gate.muted = true;
-            gate.last_probe = Some(Instant::now());
+            gate.silenced = true;
+            gate.ref_before = raw;
+            gate.calib_probed = false;
+            gate.quiet_since = None;
         }
     } else {
         gate.quiet_since = None;
-        if peak > release {
-            gate.zero_hits = 0;
-        }
     }
 }
 
@@ -405,16 +393,16 @@ pub fn toggle_manual_mute() -> bool {
     gate.manual_mute = !gate.manual_mute;
     let want = gate.manual_mute;
     if let Some(b) = &gate.bound {
-        set_mute(b, want);
+        if want {
+            set_gain(b, 1.0);
+            set_mute(b, true);
+        } else {
+            set_mute(b, false);
+            set_gain(b, 1.0);
+        }
     }
-    gate.muted = want;
-    gate.probe_start = None;
-    gate.last_probe = None;
-    if !want {
-        gate.quiet_since = None;
-        gate.blind = false;
-        gate.zero_hits = 0;
-    }
+    gate.silenced = false;
+    gate.quiet_since = None;
     want
 }
 
@@ -432,25 +420,23 @@ pub fn bound_name() -> Option<String> {
     }
 }
 
-/// 断开 / 退出前的清理：解除静音并解绑
+/// 断开 / 退出前的清理：解除静音、还原音量并清空状态。
+/// 即使当前不是由我们压低的，也把音量还原到 100%，避免上次异常退出留下哑音轨。
 pub fn release_all() {
     let mut guard = match GATE.lock() {
         Ok(g) => g,
         Err(_) => return,
     };
     if let Some(gate) = guard.as_mut() {
-        if gate.muted || gate.manual_mute {
-            if let Some(b) = &gate.bound {
-                set_mute(b, false);
-            }
+        if let Some(b) = &gate.bound {
+            set_mute(b, false);
+            set_gain(b, 1.0);
         }
-        gate.muted = false;
+        gate.silenced = false;
         gate.manual_mute = false;
         gate.bound = None;
         gate.quiet_since = None;
-        gate.blind = false;
-        gate.zero_hits = 0;
-        gate.last_probe = None;
-        gate.probe_start = None;
+        gate.calib = Calib::Unknown;
+        gate.calib_probed = false;
     }
 }

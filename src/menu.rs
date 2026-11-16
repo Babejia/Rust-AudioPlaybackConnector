@@ -11,11 +11,13 @@ pub const IDM_EXIT: u32 = 2;
 
 /// 静音门相关命令
 pub const IDM_GATE_TOGGLE: u32 = 10;
-pub const IDM_GATE_TH_BASE: u32 = 20; // 20..=24
-/// 可选门槛（dBFS），跨度拉大方便试
-pub const THRESHOLD_PRESETS: [f32; 5] = [-20.0, -27.0, -34.0, -42.0, -50.0];
+pub const IDM_GATE_TH_BASE: u32 = 20; // 20..24
+/// 可选门槛（dBFS）。实测可用区间在 −36 ~ −39 之间，
+/// 所以选项围着它铺开，而不是无意义地往 −50 走。
+pub const THRESHOLD_PRESETS: [f32; 5] = [-30.0, -34.0, -38.0, -42.0, -46.0];
 pub const IDM_GATE_TH_COUNT: u32 = THRESHOLD_PRESETS.len() as u32;
 pub const IDM_GATE_MUTE: u32 = 30;
+pub const IDM_GATE_CALIB: u32 = 40;
 
 static NEXT_DEVICE_ID: AtomicU32 = AtomicU32::new(IDM_DEVICE_BASE);
 
@@ -27,13 +29,17 @@ fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
-pub fn create_context_menu(
-    gate_enabled: bool,
-    threshold_db: f32,
-    manual_muted: bool,
-    hotkey: &str,
-    status: &str,
-) -> HMENU {
+pub struct MenuState<'a> {
+    pub enabled: bool,
+    pub threshold_db: f32,
+    pub manual_muted: bool,
+    pub hotkey: &'a str,
+    pub status: &'a str,
+    /// 当前有可用的音轨电平，才能做标定
+    pub can_calibrate: bool,
+}
+
+pub fn create_context_menu(st: &MenuState) -> HMENU {
     unsafe {
         let menu = CreatePopupMenu().expect("CreatePopupMenu failed");
 
@@ -42,16 +48,16 @@ pub fn create_context_menu(
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
 
         // —— 手机音轨自动静音 ——
-        let gate_label = if hotkey.trim().is_empty() {
+        let gate_label = if st.hotkey.trim().is_empty() {
             "手机小音量自动静音".to_string()
         } else {
-            format!("手机小音量自动静音（{}）", hotkey.trim())
+            format!("手机小音量自动静音（{}）", st.hotkey.trim())
         };
         let _ = AppendMenuW(menu, MF_STRING, IDM_GATE_TOGGLE as usize, PCWSTR(wide(&gate_label).as_ptr()));
         let _ = CheckMenuItem(
             menu,
             IDM_GATE_TOGGLE,
-            (MF_BYCOMMAND | if gate_enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
+            (MF_BYCOMMAND | if st.enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
         );
 
         // 门槛子菜单
@@ -64,17 +70,21 @@ pub fn create_context_menu(
                 sub,
                 id,
                 (MF_BYCOMMAND
-                    | if (*preset - threshold_db).abs() < 0.5 { MF_CHECKED } else { MF_UNCHECKED })
+                    | if (*preset - st.threshold_db).abs() < 0.5 { MF_CHECKED } else { MF_UNCHECKED })
                     .0,
             );
         }
-        let sub_label = format!("安静门槛（{} dB）", threshold_db as i32);
+        let sub_label = format!("安静门槛（{} dB）", st.threshold_db as i32);
         let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(wide(&sub_label).as_ptr()));
 
-        let mute_label = if manual_muted { "取消静音" } else { "立即静音" };
+        // 一键标定：把手机调到想要静音的那一档，点这里
+        let calib_flags = if st.can_calibrate { MF_STRING } else { MF_STRING | MF_GRAYED };
+        let _ = AppendMenuW(menu, calib_flags, IDM_GATE_CALIB as usize, PCWSTR(wide("以当前音量作为静音点").as_ptr()));
+
+        let mute_label = if st.manual_muted { "取消静音" } else { "立即静音" };
         let _ = AppendMenuW(menu, MF_STRING, IDM_GATE_MUTE as usize, PCWSTR(wide(mute_label).as_ptr()));
 
-        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(status).as_ptr()));
+        let _ = AppendMenuW(menu, MF_STRING | MF_GRAYED, 0, PCWSTR(wide(st.status).as_ptr()));
 
         let _ = AppendMenuW(menu, MF_SEPARATOR, 0, PCWSTR::null());
         let _ = AppendMenuW(menu, MF_STRING, IDM_EXIT as usize, PCWSTR(wide("退出").as_ptr()));

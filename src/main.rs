@@ -215,8 +215,17 @@ fn on_tray_right_click(hwnd: HWND) {
             None => "未找到手机音轨（手机未播放？）".to_string(),
         };
 
+        let can_calibrate = volume::current_level_db().is_some();
         let muted = volume::is_manual_muted();
-        let menu = menu::create_context_menu(enabled, threshold, muted, &hotkey, &status);
+        let st = menu::MenuState {
+            enabled,
+            threshold_db: threshold,
+            manual_muted: muted,
+            hotkey: &hotkey,
+            status: &status,
+            can_calibrate,
+        };
+        let menu = menu::create_context_menu(&st);
         let _ = TrackPopupMenu(menu, TRACK_POPUP_MENU_FLAGS(0), pt.x, pt.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
     }
@@ -292,6 +301,20 @@ fn handle_menu_command(hwnd: HWND, cmd_id: u32) {
         }
         menu::IDM_GATE_MUTE => {
             let _ = volume::toggle_manual_mute();
+        }
+        menu::IDM_GATE_CALIB => {
+            // 把当前电平往上抬 2 dB 作为门槛：这一档及更小都会静音
+            if let Some(level) = volume::current_level_db() {
+                let t = (level + 2.0).round().clamp(-60.0, -10.0);
+                {
+                    let mut guard = APP_STATE.lock().unwrap();
+                    if let Some(ref mut s) = *guard {
+                        s.settings.threshold_db = t;
+                        s.settings.release_db = (t + 4.0).min(-6.0);
+                    }
+                }
+                save_state();
+            }
         }
         id if id >= menu::IDM_GATE_TH_BASE && id <= th_last => {
             let idx = (id - menu::IDM_GATE_TH_BASE) as usize;
