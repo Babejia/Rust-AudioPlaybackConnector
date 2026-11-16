@@ -63,9 +63,11 @@ struct Gate {
     ref_before: f32,
     /// 是否已用这一刻的读数做过校准
     calib_probed: bool,
-    /// 最近几秒的真实电平峰值（缓慢衰减）——标定时用它，
+    /// 最近十几秒的真实电平峰值（dB，按 1.8 dB/秒 衰减）——标定时用它，
     /// 避免正好赶上音乐里一个安静的瞬间导致门槛设低
-    recent_max: f32,
+    recent_db: f32,
+    /// 上面这个值最后一次更新的时间
+    max_at: Option<Instant>,
 }
 
 static GATE: Mutex<Option<Gate>> = Mutex::new(None);
@@ -82,8 +84,32 @@ pub fn init() {
         calib: Calib::Unknown,
         ref_before: 0.0,
         calib_probed: false,
-        recent_max: 0.0,
+        recent_db: -120.0,
+        max_at: None,
     });
+}
+
+/// 把一次电平读数记入“近期峰值”（带时间衰减，约 10 秒窗口）
+fn push_level(gate: &mut Gate, real: f32) {
+    let cur = linear_to_db(real);
+    if cur <= -119.0 {
+        return;
+    }
+    let now = Instant::now();
+    let decayed = match gate.max_at {
+        Some(t) => {
+            let dt = t.elapsed().as_secs_f32();
+            if dt > 5.0 {
+                // 太久没更新，重新开始
+                cur
+            } else {
+                gate.recent_db - 1.8 * dt
+            }
+        }
+        None => cur,
+    };
+    gate.recent_db = if cur > decayed { cur } else { decayed };
+    gate.max_at = Some(now);
 }
 
 fn db_to_linear(db: f32) -> f32 { 10f32.powf(db / 20.0) }
@@ -264,15 +290,54 @@ pub fn is_silenced() -> bool {
     }
 }
 
-/// 供标定使用：最近几秒的真实电平峰值（比瞬时值稳，不会刚好赶上安静瞬间）
+/// 供标定使用：最近约 10 秒的真实电平峰值（比瞬时值稳，不会刚好赶上安静瞬间）
 pub fn recent_max_db() -> Option<f32> {
     let g = GATE.lock().ok()?;
     let gate = g.as_ref()?;
     gate.bound.as_ref()?;
-    if gate.recent_max <= 0.0 {
+    if gate.recent_db <= -119.0 {
         return None;
     }
-    Some(linear_to_db(gate.recent_max))
+    Some(gate.recent_db)
+}
+
+/// 按需刷新（打开菜单 / 点标定时调用）：绑定并读一次电平。
+/// 功能关闭时不会在后台轮询，就靠这个保证菜单里仍能看到当前电平。
+pub fn sync_now(s: &GateSettings) {
+    let mut guard = match GATE.lock() {
+        Ok(g) => g,
+        Err(_) => return,
+    };
+    let gate = match guard.as_mut() {
+        Some(g) => g,
+        None => return,
+    };
+
+    if gate.bound.is_none() {
+        match try_bind(s) {
+            Some(b) => {
+                gate.bound = Some(b);
+                gate.recent_db = -120.0;
+                gate.max_at = None;
+            }
+            None => return,
+        }
+    }
+
+    let raw = match gate.bound.as_ref().and_then(read_peak) {
+        Some(v) => v,
+        None => {
+            gate.bound = None;
+            return;
+        }
+    };
+
+    let real = if gate.silenced && gate.calib == Calib::Reflected {
+        raw / SILENCE_GAIN
+    } else {
+        raw
+    };
+    push_level(gate, real);
 }
 
 /// 每 100ms 由 UI 线程定时器调用
@@ -288,8 +353,22 @@ pub fn tick(s: &GateSettings) {
 
     gate.ticks = gate.ticks.wrapping_add(1);
 
-    // 绑定：未绑定时重试（最多 2 秒一次），并定期重新枚举以适配换设备/换手机。
-    // 注意：即使功能关闭也照样绑定 —— 菜单要显示实时电平、标定也要用它。
+    // 功能关闭：完全不轮询（不枚举会话、不读电表）。
+    // 菜单里的电平与标定走 sync_now()，只在用户操作时读一次。
+    if !s.enabled {
+        if gate.silenced || gate.manual_mute {
+            if let Some(b) = &gate.bound {
+                set_mute(b, false);
+                set_gain(b, 1.0);
+            }
+            gate.silenced = false;
+            gate.manual_mute = false;
+        }
+        gate.quiet_since = None;
+        return;
+    }
+
+    // 绑定：未绑定时重试（最多 2 秒一次），并定期重新枚举以适配换设备/换手机
     let need_bind = gate.bound.is_none() || gate.ticks % 1000 == 0;
     if need_bind {
         if gate.bound.is_none() {
@@ -306,7 +385,8 @@ pub fn tick(s: &GateSettings) {
                 gate.quiet_since = None;
                 gate.calib = Calib::Unknown;
                 gate.calib_probed = false;
-                gate.recent_max = 0.0;
+                gate.recent_db = -120.0;
+                gate.max_at = None;
             }
             None => {
                 gate.bound = None;
@@ -325,20 +405,6 @@ pub fn tick(s: &GateSettings) {
             }
         }
     };
-
-    // 功能关闭：还原音量，但**不解绑** —— 菜单要显示电平、标定也要靠它
-    if !s.enabled {
-        if gate.silenced || gate.manual_mute {
-            if let Some(b) = &gate.bound {
-                set_mute(b, false);
-                set_gain(b, 1.0);
-            }
-            gate.silenced = false;
-            gate.manual_mute = false;
-        }
-        gate.quiet_since = None;
-        return;
-    }
 
     // 手动静音：真静音，不参与自动判定
     if gate.manual_mute {
@@ -366,12 +432,8 @@ pub fn tick(s: &GateSettings) {
         raw
     };
 
-    // 记录近期峰值（约 −0.04 dB/秒 缓慢衰减），标定时用它更稳
-    if real > gate.recent_max {
-        gate.recent_max = real;
-    } else {
-        gate.recent_max *= 0.999;
-    }
+    // 记录近期峰值（供标定使用）
+    push_level(gate, real);
 
     if gate.silenced {
         // 已经压低音量：真实电平回来了就恢复

@@ -201,6 +201,11 @@ fn on_tray_right_click(hwnd: HWND) {
             .map(|s| (s.settings.enabled, s.settings.threshold_db, s.settings.hotkey.clone()))
             .unwrap_or((false, -34.0, String::new()));
 
+        // 按需读一次电平（功能关闭时后台不轮询，菜单里照样能看到当前值）
+        if let Some(s) = current_settings() {
+            volume::sync_now(&s);
+        }
+
         let status = match volume::bound_name() {
             Some(n) => {
                 let lv = volume::current_level_db()
@@ -303,8 +308,11 @@ fn handle_menu_command(hwnd: HWND, cmd_id: u32) {
             let _ = volume::toggle_manual_mute();
         }
         menu::IDM_GATE_CALIB => {
-            // 用“最近几秒的峰值”而不是瞬时值，避免刚好赶上安静瞬间把门槛设太低。
-            // 加 2 dB 保证这一档（及更小）一定算“安静”。
+            // 先按需读一次，再取“最近 10 秒峰值”作为基准：
+            // 比瞬时值稳，不会刚好赶上音乐里的安静瞬间把门槛设太低
+            if let Some(s) = current_settings() {
+                volume::sync_now(&s);
+            }
             if let Some(level) = volume::recent_max_db().or_else(volume::current_level_db) {
                 let t = (level + 2.0).round().clamp(-60.0, -10.0);
                 {
