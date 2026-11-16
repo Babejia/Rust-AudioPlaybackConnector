@@ -36,7 +36,7 @@ pub struct GateSettings {
 fn d_true() -> bool { true }
 fn d_threshold() -> f32 { -34.0 }
 fn d_release() -> f32 { -30.0 }
-fn d_hold() -> u32 { 1200 }
+fn d_hold() -> u32 { 4000 }
 fn d_hotkey() -> String { "Pause".to_string() }
 
 impl Default for GateSettings {

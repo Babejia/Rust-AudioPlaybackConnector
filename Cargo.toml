@@ -1,6 +1,6 @@
 [package]
 name = "audio-playback-connector-rs"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 description = "Bluetooth audio playback (A2DP Sink) connector for Windows 10 2004+"
 

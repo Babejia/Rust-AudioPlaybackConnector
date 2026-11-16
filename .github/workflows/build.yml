@@ -3,7 +3,11 @@ name: build
 on:
   push:
     branches: [ master, main ]
+    tags: [ 'v*' ]
   workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
   windows:
@@ -30,3 +34,15 @@ jobs:
           name: AudioPlaybackConnector-rs
           path: out/
           if-no-files-found: error
+
+      # 推 tag（v1.2.3 这种）时，自动建 Release 并把 exe 挂上去
+      - name: Publish release
+        if: startsWith(github.ref, 'refs/tags/v')
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "${GITHUB_REF_NAME}" \
+            out/audio-playback-connector-rs.exe \
+            --title "AudioPlaybackConnector (Rust) ${GITHUB_REF_NAME}" \
+            --generate-notes
