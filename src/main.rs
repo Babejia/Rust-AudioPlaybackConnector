@@ -10,6 +10,7 @@ mod i18n;
 mod icon;
 mod menu;
 mod tray;
+mod volume;
 
 use config::AppConfig;
 use device::DeviceState;
@@ -35,6 +36,7 @@ struct AppState {
     reconnect: bool,
     last_devices: Vec<String>,
     device_mapping: Vec<(u32, String)>,
+    settings: config::GateSettings,
 }
 
 unsafe impl Send for AppState {}
@@ -46,13 +48,28 @@ const WM_NOTIFYICON: u32 = WM_APP + 1;
 const WM_CONNECTDEVICE: u32 = WM_APP + 2;
 static WM_TASKBAR_CREATED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
+/// 静音门轮询定时器
+const TIMER_GATE: usize = 1;
+/// 全局热键 ID
+const HOTKEY_ID: i32 = 1;
+
 // ─── Window Procedure ────────────────────────────────────────────────
 
 extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     unsafe {
         match msg {
             WM_DESTROY => {
-                on_destroy();
+                on_destroy(hwnd);
+                LRESULT(0)
+            }
+            WM_TIMER => {
+                if wparam.0 == TIMER_GATE {
+                    tick_gate();
+                }
+                LRESULT(0)
+            }
+            WM_HOTKEY => {
+                let _ = volume::toggle_manual_mute();
                 LRESULT(0)
             }
             WM_SETTINGCHANGE => {
@@ -111,6 +128,29 @@ extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM
     }
 }
 
+// ─── 静音门辅助 ──────────────────────────────────────────────────────
+
+fn current_settings() -> Option<config::GateSettings> {
+    APP_STATE.lock().unwrap().as_ref().map(|s| s.settings.clone())
+}
+
+fn tick_gate() {
+    if let Some(s) = current_settings() {
+        volume::tick(&s);
+    }
+}
+
+/// 把当前状态写回配置文件
+fn save_state() {
+    let snapshot = {
+        let guard = APP_STATE.lock().unwrap();
+        guard.as_ref().map(|s| (s.reconnect, s.last_devices.clone(), s.settings.clone()))
+    };
+    if let Some((reconnect, last_devices, gate)) = snapshot {
+        config::save_config(&config::AppConfig { reconnect, last_devices, gate });
+    }
+}
+
 // ─── Event Handlers ──────────────────────────────────────────────────
 
 fn on_tray_left_click(hwnd: HWND) {
@@ -151,22 +191,32 @@ fn on_tray_right_click(hwnd: HWND) {
         let _ = SetWindowPos(hwnd, HWND_TOPMOST, 0, 0, 1, 1, SWP_SHOWWINDOW);
         SetForegroundWindow(hwnd);
 
-        let menu = menu::create_context_menu();
+        let (enabled, threshold, hotkey) = APP_STATE
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|s| (s.settings.enabled, s.settings.threshold_db, s.settings.hotkey.clone()))
+            .unwrap_or((false, -34.0, String::new()));
+
+        let bound = volume::bound_name();
+        let muted = volume::is_manual_muted();
+        let menu = menu::create_context_menu(enabled, threshold, bound.as_deref(), muted, &hotkey);
         let _ = TrackPopupMenu(menu, TRACK_POPUP_MENU_FLAGS(0), pt.x, pt.y, 0, hwnd, None);
         let _ = DestroyMenu(menu);
     }
 }
 
-fn on_destroy() {
+fn on_destroy(hwnd: HWND) {
     unsafe {
+        let _ = KillTimer(hwnd, TIMER_GATE);
+        let _ = UnregisterHotKey(hwnd, HOTKEY_ID);
+        volume::release_all();
         device::close_all_connections();
+
+        save_state();
 
         let guard = APP_STATE.lock().unwrap();
         if let Some(ref state) = *guard {
-            config::save_config(&AppConfig {
-                reconnect: state.reconnect,
-                last_devices: state.last_devices.clone(),
-            });
             state.tray.remove();
         }
         PostQuitMessage(0);
@@ -193,23 +243,54 @@ fn on_reconnect() {
 fn handle_menu_command(hwnd: HWND, cmd_id: u32) {
     if menu::is_device_command(cmd_id) {
         handle_device_command(cmd_id);
-    } else {
-        match cmd_id {
-            1 => {
-                // Open Bluetooth settings
-                let _ = std::process::Command::new("cmd")
-                    .args(["/c", "start", "ms-settings:bluetooth"])
-                    .spawn();
-            }
-            3 => {
-                // Open Sound settings so user can select the Bluetooth device
-                let _ = std::process::Command::new("cmd")
-                    .args(["/c", "start", "ms-settings:sound"])
-                    .spawn();
-            }
-            2 => on_exit_request(hwnd),
-            _ => {}
+        return;
+    }
+
+    let th_last = menu::IDM_GATE_TH_BASE + menu::IDM_GATE_TH_COUNT - 1;
+
+    match cmd_id {
+        menu::IDM_SETTINGS => {
+            // Open Bluetooth settings
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "ms-settings:bluetooth"])
+                .spawn();
         }
+        menu::IDM_SOUND => {
+            // Open Sound settings so user can select the Bluetooth device
+            let _ = std::process::Command::new("cmd")
+                .args(["/c", "start", "ms-settings:sound"])
+                .spawn();
+        }
+        menu::IDM_EXIT => on_exit_request(hwnd),
+        menu::IDM_GATE_TOGGLE => {
+            {
+                let mut guard = APP_STATE.lock().unwrap();
+                if let Some(ref mut s) = *guard {
+                    s.settings.enabled = !s.settings.enabled;
+                }
+            }
+            if !current_settings().map(|s| s.enabled).unwrap_or(false) {
+                volume::release_all();
+            }
+            save_state();
+        }
+        menu::IDM_GATE_MUTE => {
+            let _ = volume::toggle_manual_mute();
+        }
+        id if id >= menu::IDM_GATE_TH_BASE && id <= th_last => {
+            let idx = (id - menu::IDM_GATE_TH_BASE) as usize;
+            if let Some(preset) = menu::THRESHOLD_PRESETS.get(idx).copied() {
+                let mut guard = APP_STATE.lock().unwrap();
+                if let Some(ref mut s) = *guard {
+                    s.settings.threshold_db = preset;
+                    // 保持 4 dB 迟滞，避免在门槛附近来回跳
+                    s.settings.release_db = preset + 4.0;
+                }
+                drop(guard);
+                save_state();
+            }
+        }
+        _ => {}
     }
 }
 
@@ -224,6 +305,7 @@ fn handle_device_command(cmd_id: u32) {
     if let Some(ref id) = device_id {
         if device::is_device_connected(id) {
             device::disconnect_device(id);
+            volume::release_all();
             let mut guard = APP_STATE.lock().unwrap();
             if let Some(ref mut s) = *guard {
                 s.tray.set_tooltip("AudioPlaybackConnector");
@@ -240,6 +322,18 @@ fn handle_device_command(cmd_id: u32) {
             }
             match device::connect_to_device(id) {
                 Ok(()) => {
+                    // 记录本次连接的设备名，供音轨匹配（换手机自动适配，不写死）
+                    if let Ok(list) = device::enumerate_a2dp_devices() {
+                        if let Some(d) = list.iter().find(|d| &d.id == id) {
+                            let mut guard = APP_STATE.lock().unwrap();
+                            if let Some(ref mut s) = *guard {
+                                s.settings.device_name = d.name.clone();
+                            }
+                        }
+                    }
+                    // 强制重新绑定到新音轨
+                    volume::release_all();
+
                     let mut guard = APP_STATE.lock().unwrap();
                     if let Some(ref mut s) = *guard {
                         s.tray.set_tooltip("AudioPlaybackConnector - 已连接");
@@ -399,6 +493,7 @@ fn main() -> Result<()> {
         let idk = icon::svg_to_hicon(svg_str, sz, sz, d2d_color(1.0, 1.0, 1.0, 1.0));
 
         device::init(|_did, _st| { /* state change callback — could refresh menu */ });
+        volume::init();
 
         // Create and add tray icon — must NIM_ADD first
         let mut tray = crate::tray::TrayIcon::new(hwnd, "AudioPlaybackConnector");
@@ -421,9 +516,21 @@ fn main() -> Result<()> {
             *guard = Some(AppState {
                 hwnd, tray, icon_light: il, icon_dark: idk,
                 reconnect: cfg.reconnect,
+                settings: cfg.gate.clone(),
                 last_devices: cfg.last_devices,
                 device_mapping: Vec::new(),
             });
+        }
+
+        // 静音门轮询（100ms 一次，开销可忽略）
+        let _ = SetTimer(hwnd, TIMER_GATE, 100, None);
+
+        // 全局热键：手动静音/恢复
+        let hotkey_text = current_settings().map(|s| s.hotkey).unwrap_or_default();
+        if let Some((mods, vk)) = volume::parse_hotkey(&hotkey_text) {
+            if RegisterHotKey(hwnd, HOTKEY_ID, HOT_KEY_MODIFIERS(mods), vk).is_err() {
+                eprintln!("[hotkey] 注册失败（可能被其它程序占用）: {}", hotkey_text);
+            }
         }
 
         let _ = PostMessageW(hwnd, WM_CONNECTDEVICE, WPARAM(0), LPARAM(0));

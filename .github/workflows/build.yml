@@ -1,0 +1,32 @@
+name: build
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  windows:
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Build (release)
+        run: cargo build --release
+
+      - name: Collect
+        shell: bash
+        run: |
+          ls -l target/release/*.exe
+          mkdir -p out
+          cp target/release/audio-playback-connector-rs.exe out/ || true
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: AudioPlaybackConnector-rs
+          path: out/
+          if-no-files-found: error
