@@ -52,8 +52,7 @@ pub fn create_context_menu(
         let _ = CheckMenuItem(
             menu,
             IDM_GATE_TOGGLE,
-            MF_BYCOMMAND
-                | if gate_enabled { MF_CHECKED } else { MF_UNCHECKED },
+            (MF_BYCOMMAND | if gate_enabled { MF_CHECKED } else { MF_UNCHECKED }).0,
         );
 
         // 门槛子菜单
@@ -65,8 +64,9 @@ pub fn create_context_menu(
             let _ = CheckMenuItem(
                 sub,
                 id,
-                MF_BYCOMMAND
-                    | if (*preset - threshold_db).abs() < 0.5 { MF_CHECKED } else { MF_UNCHECKED },
+                (MF_BYCOMMAND
+                    | if (*preset - threshold_db).abs() < 0.5 { MF_CHECKED } else { MF_UNCHECKED })
+                    .0,
             );
         }
         let _ = AppendMenuW(menu, MF_POPUP, sub.0 as usize, PCWSTR(wide("安静门槛").as_ptr()));

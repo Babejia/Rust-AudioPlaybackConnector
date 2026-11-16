@@ -24,6 +24,9 @@ use windows::Win32::System::Com::*;
 use windows::Win32::System::LibraryLoader::*;
 use windows::Win32::System::Registry::*;
 use windows::Win32::UI::Controls::*;
+use windows::Win32::UI::Input::KeyboardAndMouse::{
+    RegisterHotKey, UnregisterHotKey, HOT_KEY_MODIFIERS,
+};
 use windows::Win32::UI::WindowsAndMessaging::*;
 
 // ─── Global Application State ────────────────────────────────────────
@@ -147,7 +150,7 @@ fn save_state() {
         guard.as_ref().map(|s| (s.reconnect, s.last_devices.clone(), s.settings.clone()))
     };
     if let Some((reconnect, last_devices, gate)) = snapshot {
-        config::save_config(&config::AppConfig { reconnect, last_devices, gate });
+        config::save_config(&AppConfig { reconnect, last_devices, gate });
     }
 }
 

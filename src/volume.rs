@@ -10,6 +10,8 @@
 use std::sync::Mutex;
 use std::time::Instant;
 use windows::core::*;
+use windows::Win32::Foundation::BOOL;
+use windows::Win32::Media::Audio::Endpoints::IAudioMeterInformation;
 use windows::Win32::Media::Audio::*;
 use windows::Win32::System::Com::*;
 
@@ -23,6 +25,10 @@ struct Bound {
     vol: ISimpleAudioVolume,
     name: String,
 }
+
+// COM 接口指针本身不是 Send；这里只从 UI 线程（定时器）访问，跨线程只是
+// 为了让静态 Mutex 能成立，访问始终发生在同一 STA 线程上。
+unsafe impl Send for Bound {}
 
 struct Gate {
     bound: Option<Bound>,
@@ -103,12 +109,24 @@ pub fn parse_hotkey(s: &str) -> Option<(u32, u32)> {
 unsafe fn session_name(ctl: &IAudioSessionControl) -> String {
     match ctl.GetDisplayName() {
         Ok(p) => {
-            let s = p.to_string().unwrap_or_default();
+            let s = pwstr_to_string(p);
             CoTaskMemFree(Some(p.0 as *const _));
             s
         }
         Err(_) => String::new(),
     }
+}
+
+/// PWSTR → String（只用最基础的指针运算，避免依赖不同版本的辅助方法）
+unsafe fn pwstr_to_string(p: PWSTR) -> String {
+    if p.is_null() {
+        return String::new();
+    }
+    let mut len = 0usize;
+    while *p.0.add(len) != 0 {
+        len += 1;
+    }
+    String::from_utf16_lossy(std::slice::from_raw_parts(p.0, len))
 }
 
 /// 严格匹配：用户指定关键字，或当前连接的 A2DP 设备名出现在音轨名里。
@@ -138,7 +156,7 @@ fn try_bind(s: &GateSettings) -> Option<Bound> {
         let enumr: IMMDeviceEnumerator =
             CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
         let dev = enumr
-            .GetDefaultAudioEndpoint(EDataFlow::eRender, ERole::eConsole)
+            .GetDefaultAudioEndpoint(eRender, eConsole)
             .ok()?;
         let mgr: IAudioSessionManager2 = dev.Activate(CLSCTX_ALL, None).ok()?;
         let sessions = mgr.GetSessionEnumerator().ok()?;
@@ -173,13 +191,14 @@ fn try_bind(s: &GateSettings) -> Option<Bound> {
 }
 
 fn make_bound(ctl: IAudioSessionControl, name: String) -> Option<Bound> {
-    let meter: IAudioMeterInformation = unsafe { ctl.cast() }.ok()?;
-    let vol: ISimpleAudioVolume = unsafe { ctl.cast() }.ok()?;
+    let meter: IAudioMeterInformation = ctl.cast().ok()?;
+    let vol: ISimpleAudioVolume = ctl.cast().ok()?;
     Some(Bound { _ctl: ctl, meter, vol, name })
 }
 
 fn set_mute(bound: &Bound, mute: bool) {
-    let _ = unsafe { bound.vol.SetMute(BOOL(if mute { 1 } else { 0 }), None) };
+    let flag = if mute { BOOL(1) } else { BOOL(0) };
+    let _ = unsafe { bound.vol.SetMute(flag, std::ptr::null()) };
 }
 
 /// 每 100ms 由 UI 线程定时器调用
