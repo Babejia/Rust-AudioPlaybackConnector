@@ -13,8 +13,8 @@ pub const IDM_EXIT: u32 = 2;
 pub const IDM_GATE_TOGGLE: u32 = 10;
 pub const IDM_GATE_TH_BASE: u32 = 20; // 20..24
 /// 可选门槛（dBFS）。实测可用区间在 −36 ~ −39 之间，
-/// 所以选项围着它铺开，而不是无意义地往 −50 走。
-pub const THRESHOLD_PRESETS: [f32; 5] = [-30.0, -34.0, -38.0, -42.0, -46.0];
+/// 所以选项围着它铺开，不往 −50 那种永远触发不了的地方走。
+pub const THRESHOLD_PRESETS: [f32; 4] = [-34.0, -38.0, -40.0, -42.0];
 pub const IDM_GATE_TH_COUNT: u32 = THRESHOLD_PRESETS.len() as u32;
 pub const IDM_GATE_MUTE: u32 = 30;
 pub const IDM_GATE_CALIB: u32 = 40;

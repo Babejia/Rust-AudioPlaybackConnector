@@ -63,6 +63,9 @@ struct Gate {
     ref_before: f32,
     /// 是否已用这一刻的读数做过校准
     calib_probed: bool,
+    /// 最近几秒的真实电平峰值（缓慢衰减）——标定时用它，
+    /// 避免正好赶上音乐里一个安静的瞬间导致门槛设低
+    recent_max: f32,
 }
 
 static GATE: Mutex<Option<Gate>> = Mutex::new(None);
@@ -79,6 +82,7 @@ pub fn init() {
         calib: Calib::Unknown,
         ref_before: 0.0,
         calib_probed: false,
+        recent_max: 0.0,
     });
 }
 
@@ -244,9 +248,11 @@ pub fn current_level_db() -> Option<f32> {
     let gate = g.as_ref()?;
     let b = gate.bound.as_ref()?;
     let raw = read_peak(b)?;
-    let source = match gate.calib {
-        Calib::Reflected => raw / SILENCE_GAIN,
-        _ => raw,
+    // 只有在“压低音量”状态下才需要补偿；否则读数本身就是真实电平
+    let source = if gate.silenced && gate.calib == Calib::Reflected {
+        raw / SILENCE_GAIN
+    } else {
+        raw
     };
     Some(linear_to_db(source))
 }
@@ -256,6 +262,17 @@ pub fn is_silenced() -> bool {
         Ok(g) => g.as_ref().map(|x| x.silenced || x.manual_mute).unwrap_or(false),
         Err(_) => false,
     }
+}
+
+/// 供标定使用：最近几秒的真实电平峰值（比瞬时值稳，不会刚好赶上安静瞬间）
+pub fn recent_max_db() -> Option<f32> {
+    let g = GATE.lock().ok()?;
+    let gate = g.as_ref()?;
+    gate.bound.as_ref()?;
+    if gate.recent_max <= 0.0 {
+        return None;
+    }
+    Some(linear_to_db(gate.recent_max))
 }
 
 /// 每 100ms 由 UI 线程定时器调用
@@ -269,24 +286,10 @@ pub fn tick(s: &GateSettings) {
         None => return,
     };
 
-    // 功能关闭：恢复原状
-    if !s.enabled {
-        if let Some(b) = &gate.bound {
-            if gate.silenced || gate.manual_mute {
-                set_mute(b, false);
-                set_gain(b, 1.0);
-            }
-        }
-        gate.silenced = false;
-        gate.manual_mute = false;
-        gate.bound = None;
-        gate.calib = Calib::Unknown;
-        return;
-    }
-
     gate.ticks = gate.ticks.wrapping_add(1);
 
-    // 绑定：未绑定时重试（最多 2 秒一次），并定期重新枚举以适配换设备/换手机
+    // 绑定：未绑定时重试（最多 2 秒一次），并定期重新枚举以适配换设备/换手机。
+    // 注意：即使功能关闭也照样绑定 —— 菜单要显示实时电平、标定也要用它。
     let need_bind = gate.bound.is_none() || gate.ticks % 1000 == 0;
     if need_bind {
         if gate.bound.is_none() {
@@ -303,6 +306,7 @@ pub fn tick(s: &GateSettings) {
                 gate.quiet_since = None;
                 gate.calib = Calib::Unknown;
                 gate.calib_probed = false;
+                gate.recent_max = 0.0;
             }
             None => {
                 gate.bound = None;
@@ -322,6 +326,20 @@ pub fn tick(s: &GateSettings) {
         }
     };
 
+    // 功能关闭：还原音量，但**不解绑** —— 菜单要显示电平、标定也要靠它
+    if !s.enabled {
+        if gate.silenced || gate.manual_mute {
+            if let Some(b) = &gate.bound {
+                set_mute(b, false);
+                set_gain(b, 1.0);
+            }
+            gate.silenced = false;
+            gate.manual_mute = false;
+        }
+        gate.quiet_since = None;
+        return;
+    }
+
     // 手动静音：真静音，不参与自动判定
     if gate.manual_mute {
         return;
@@ -337,18 +355,27 @@ pub fn tick(s: &GateSettings) {
         };
     }
 
-    let source = match gate.calib {
-        Calib::Reflected => raw / SILENCE_GAIN,
-        _ => raw,
-    };
-
     let threshold = db_to_linear(s.threshold_db);
     let release = db_to_linear(s.release_db);
     let hold_ms = s.hold_ms as u128;
 
+    // 真实电平：压低音量且电表会被缩放时，把读数补偿回去
+    let real = if gate.silenced && gate.calib == Calib::Reflected {
+        raw / SILENCE_GAIN
+    } else {
+        raw
+    };
+
+    // 记录近期峰值（约 −0.04 dB/秒 缓慢衰减），标定时用它更稳
+    if real > gate.recent_max {
+        gate.recent_max = real;
+    } else {
+        gate.recent_max *= 0.999;
+    }
+
     if gate.silenced {
         // 已经压低音量：真实电平回来了就恢复
-        if source > release {
+        if real > release {
             if let Some(b) = &gate.bound {
                 set_gain(b, 1.0);
             }
@@ -358,8 +385,8 @@ pub fn tick(s: &GateSettings) {
         return;
     }
 
-    // 正常判定
-    if source < threshold {
+    // 正常判定：此时 real 就是真实电平
+    if real < threshold {
         let now = Instant::now();
         if gate.quiet_since.is_none() {
             gate.quiet_since = Some(now);

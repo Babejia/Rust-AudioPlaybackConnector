@@ -207,7 +207,7 @@ fn on_tray_right_click(hwnd: HWND) {
                     .map(|d| format!("{:.1} dB", d))
                     .unwrap_or_else(|| "—".to_string());
                 if volume::is_silenced() {
-                    format!("{} · {} · 已静音", n, lv)
+                    format!("{} · 实际 {} · 已静音", n, lv)
                 } else {
                     format!("{} · {}", n, lv)
                 }
@@ -303,8 +303,9 @@ fn handle_menu_command(hwnd: HWND, cmd_id: u32) {
             let _ = volume::toggle_manual_mute();
         }
         menu::IDM_GATE_CALIB => {
-            // 把当前电平往上抬 2 dB 作为门槛：这一档及更小都会静音
-            if let Some(level) = volume::current_level_db() {
+            // 用“最近几秒的峰值”而不是瞬时值，避免刚好赶上安静瞬间把门槛设太低。
+            // 加 2 dB 保证这一档（及更小）一定算“安静”。
+            if let Some(level) = volume::recent_max_db().or_else(volume::current_level_db) {
                 let t = (level + 2.0).round().clamp(-60.0, -10.0);
                 {
                     let mut guard = APP_STATE.lock().unwrap();
